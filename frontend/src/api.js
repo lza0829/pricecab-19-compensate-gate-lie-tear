@@ -42,6 +42,7 @@ export const api = {
   markMisapply: (body) =>
     request('/api/compensation/markers', { method: 'POST', body: JSON.stringify(body) }),
   gates: () => request('/api/compensation/gates'),
+  gateIntegrity: () => request('/api/compensation/gates/integrity'),
   createCompensationTicket: (body) =>
     request('/api/compensation/tickets', { method: 'POST', body: JSON.stringify(body) }),
   batch: (id) => request(`/api/apply/batches/${id}`),

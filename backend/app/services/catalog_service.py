@@ -32,9 +32,7 @@ def dashboard() -> dict[str, Any]:
             "sale_count": conn.execute("SELECT COUNT(*) c FROM sales_fixture").fetchone()["c"],
             "batch_count": conn.execute("SELECT COUNT(*) c FROM apply_batches").fetchone()["c"],
             "due_now": len(ticket_repo.due_tickets(conn, clock or "")),
-            "open_marker_count": conn.execute(
-                "SELECT COUNT(*) c FROM misapply_markers WHERE status='open'"
-            ).fetchone()["c"],
+            "open_marker_count": len(comp_repo.fact_open_markers(conn)),
             "gated_sku_count": len(comp_repo.blocked_skus(conn)),
             "compensation_strategy": settings_repo.get(conn, "compensation_strategy", "manual"),
         }

@@ -11,7 +11,6 @@ from app.repositories import tickets as ticket_repo
 from app.repositories import prices as price_repo
 from app.repositories import batches as batch_repo
 from app.repositories import compensation as comp_repo
-from app.repositories import gate_shadow
 
 
 def _now() -> str:
@@ -71,6 +70,9 @@ def apply_due() -> dict[str, Any]:
             raise HTTPException(400, "业务钟未设置")
         due = ticket_repo.due_tickets(conn, clock)
         if not due:
+            # Still a closing point: a lied marker (flipped without compensation
+            # evidence) gets recomputed even when nothing is due to apply.
+            reconciliation = comp_repo.reconcile_with_facts(conn, now=_now())
             conn.commit()
             return {
                 "applied": False,
@@ -78,19 +80,24 @@ def apply_due() -> dict[str, Any]:
                 "business_clock": clock,
                 "ticket_count": 0,
                 "line_count": 0,
+                "tickets": [],
+                "resolved_marker_ids": [r["marker_id"] for r in reconciliation["resolved"]],
+                "reopened_marker_ids": [r["marker_id"] for r in reconciliation["reopened"]],
+                "skipped_gated": [],
             }
 
         # Gate (apply-time recheck): a non-compensation ticket must never land
-        # while any of its SKUs is covered by an open misapply marker. The gate
-        # state is snapshotted at run start and holds for the whole run, so a
-        # compensation that resolves a marker in this run cannot smuggle a
-        # blocked normal ticket into the same batch — the held ticket stays
-        # scheduled and is reconsidered on the next run after the gate lifted.
-        # Compensation tickets are exempt and processed first, which keeps the
-        # correction path free of deadlocks.
-        gate_snapshot = set()
-        open_markers = comp_repo.open_markers(conn)
-        _ = comp_repo.blocked_skus(conn)
+        # while any of its SKUs is gated by a misapply marker whose applied
+        # compensation does not yet cover it. The gate has no independent
+        # switch: it is recomputed from compensation-ticket + price-tag-source
+        # facts and snapshotted at run start, so a compensation that resolves a
+        # marker in this run cannot smuggle a blocked normal ticket into the
+        # same batch — the held ticket stays scheduled and is reconsidered on
+        # the next run after the gate lifted. Compensation tickets are exempt
+        # and processed first, which keeps the correction path free of
+        # deadlocks.
+        gate_snapshot = comp_repo.blocked_skus(conn)
+        open_markers = comp_repo.fact_open_markers(conn)
         due.sort(key=lambda t: (0 if t["kind"] == "compensation" else 1, t["effective_at"], t["id"]))
 
         created = _now()
@@ -149,20 +156,19 @@ def apply_due() -> dict[str, Any]:
                 line_total += 1
             ticket_repo.mark_applied(conn, t["id"], applied_at=created, batch_id=batch_id)
             applied_tickets.append(t["ticket_no"])
-            # Compensation writes go through the exact same path; once applied
-            # they may lift the gate by fully covering their marker.
-            if t["kind"] == "compensation" and t["compensates_marker_id"] is not None:
-                gate_shadow.force_open(conn, t["compensates_marker_id"])
-                if comp_repo.resolve_if_covered(
-                    conn,
-                    t["compensates_marker_id"],
-                    applied_ticket_id=t["id"],
-                    at=created,
-                ):
-                    resolved_markers.append(t["compensates_marker_id"])
+
+        # Single closing point: recompute every marker from compensation facts
+        # after the whole due run. Compensation writes went through the exact
+        # same price-book/history path as normal tickets, so a marker resolves
+        # only when applied compensation tickets cover all its SKUs with
+        # price-tag-source evidence; a marker lacking that evidence is forced
+        # back open even if its status was flipped without proof.
+        reconciliation = comp_repo.reconcile_with_facts(conn, now=created)
+        resolved_markers = [r["marker_id"] for r in reconciliation["resolved"]]
 
         if batch_id is None:
-            # Everything due was held back by the gate.
+            # Everything due was held back by the gate. Still persist any
+            # fact-based marker corrections (e.g. a lied gate re-closing).
             conn.commit()
             return {
                 "applied": False,
@@ -171,7 +177,8 @@ def apply_due() -> dict[str, Any]:
                 "ticket_count": 0,
                 "line_count": 0,
                 "tickets": [],
-                "resolved_marker_ids": [],
+                "resolved_marker_ids": resolved_markers,
+                "reopened_marker_ids": [r["marker_id"] for r in reconciliation["reopened"]],
                 "skipped_gated": skipped_gated,
             }
 
@@ -188,6 +195,7 @@ def apply_due() -> dict[str, Any]:
             "line_count": line_total,
             "tickets": applied_tickets,
             "resolved_marker_ids": resolved_markers,
+            "reopened_marker_ids": [r["marker_id"] for r in reconciliation["reopened"]],
             "skipped_gated": skipped_gated,
         }
     except HTTPException:

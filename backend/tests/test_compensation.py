@@ -454,3 +454,356 @@ def test_no_rollback_or_delete_endpoints_exist(client):
     # no DELETE method on any route
     for route in client.app.routes:
         assert "DELETE" not in getattr(route, "methods", set())
+
+
+# ---------------------------------------------------------------------------
+# Adversarial closing-rule tests: the gate is recomputed from compensation
+# facts + price-tag source, never from an independent switch.
+# ---------------------------------------------------------------------------
+
+def _raw_conn():
+    import sqlite3
+
+    from app import config
+
+    conn = sqlite3.connect(str(config.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _prepare_gated_marker(client):
+    """One applied normal ticket (misuse), plus an already-scheduled normal
+    ticket that only the apply-time recheck can catch, then an open marker."""
+    _set_clock(client, "2026-11-16T09:00:00Z")
+    bad = _make_ticket(client, "2026-11-16T09:30:00Z", price=99.0)
+    blocked = _make_ticket(client, "2026-11-16T10:15:00Z", price=77.0, title="先建后闸单")
+    _set_clock(client, "2026-11-16T10:00:00Z")
+    _apply_due(client)
+    assert _book_price(client) == 99.0
+    r = client.post(
+        "/api/compensation/markers",
+        json={"target_type": "ticket", "target_id": bad["id"]},
+    )
+    assert r.status_code == 200, r.text
+    return bad, r.json()["marker"], blocked
+
+
+def test_gate_open_normal_apply_never_lands_on_price_tag(client):
+    """Path A '闸开仍普通应用成功': while the gate is open a due normal ticket
+    must be refused at apply time — no price-book/history write, stays
+    scheduled, reported in skipped_gated; build-time rejection also holds."""
+    _, marker, blocked = _prepare_gated_marker(client)
+
+    # build-time refusal
+    r = client.post(
+        "/api/tickets",
+        json={
+            "title": "禁闸期普通单",
+            "effective_at": "2026-11-16T10:30:00Z",
+            "lines": [{"sku_code": SKU, "new_price": 88.0}],
+        },
+    )
+    assert r.status_code == 409
+
+    # the pre-existing scheduled ticket can only be caught at apply time
+    _set_clock(client, "2026-11-16T11:00:00Z")
+    res = _apply_due(client)
+    assert res["applied"] is False
+    assert [s["ticket_id"] for s in res["skipped_gated"]] == [blocked["id"]]
+    assert client.get(f"/api/tickets/{blocked['id']}").json()["status"] == "scheduled"
+
+    # price tag must still be the misuse price, and its source is not the
+    # blocked normal ticket (three-way cross evidence)
+    assert _book_price(client) == 99.0
+    book = next(r for r in client.get("/api/prices/book").json() if r["sku_code"] == SKU)
+    assert book["source_ticket_no"] != blocked["ticket_no"]
+    hist = client.get("/api/prices/history", params={"sku_code": SKU}).json()
+    assert all(h["source_ticket_no"] != blocked["ticket_no"] for h in hist)
+
+    # gate endpoint agrees with the marker table
+    gates = client.get("/api/compensation/gates").json()
+    assert gates["blocked_skus"] == [SKU]
+    assert gates["gates"][0]["marker_id"] == marker["id"]
+
+
+def test_resolved_without_compensation_is_forced_back_closed(client):
+    """Path B '无补偿却显示已解除': flip the marker status to resolved with no
+    applied compensation. Every gate read must recompute from facts, force it
+    back open, refuse normal applies and flag the divergence."""
+    _, marker, blocked = _prepare_gated_marker(client)
+
+    # lie directly at the storage layer (no API exists to do this)
+    conn = _raw_conn()
+    conn.execute(
+        "UPDATE misapply_markers SET status='resolved', resolved_at='2026-11-16T10:30:00Z' WHERE id=?",
+        (marker["id"],),
+    )
+    conn.commit()
+    conn.close()
+
+    integrity = client.get("/api/compensation/gates/integrity").json()
+    kinds = {d["kind"] for d in integrity["divergences"]}
+    assert "resolved_without_compensation" in kinds
+    # read-only check does not repair by itself
+    conn = _raw_conn()
+    assert conn.execute(
+        "SELECT status FROM misapply_markers WHERE id=?", (marker["id"],)
+    ).fetchone()["status"] == "resolved"
+    conn.close()
+
+    # build-time entry never trusts the lied column either: it recomputes the
+    # gate from facts and refuses before any repair endpoint was touched
+    r = client.post(
+        "/api/tickets",
+        json={
+            "title": "谎言闸下的普通单",
+            "effective_at": "2026-11-16T10:45:00Z",
+            "lines": [{"sku_code": SKU, "new_price": 50.0}],
+        },
+    )
+    assert r.status_code == 409
+    assert client.get("/api/dashboard").json()["gated_sku_count"] == 1
+
+    # the gate endpoint is a closing point: it recomputes and re-closes
+    gates = client.get("/api/compensation/gates").json()
+    assert gates["blocked_skus"] == [SKU]
+    assert gates["reopened_marker_ids"] == [marker["id"]]
+    conn = _raw_conn()
+    row = conn.execute(
+        "SELECT status, resolved_at, resolved_ticket_id FROM misapply_markers WHERE id=?",
+        (marker["id"],),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == "open"
+    assert row["resolved_at"] is None
+    assert row["resolved_ticket_id"] is None
+
+    # normal apply still refused; lifting requires a real applied compensation
+    _set_clock(client, "2026-11-16T11:00:00Z")
+    res = _apply_due(client)
+    assert [s["ticket_id"] for s in res["skipped_gated"]] == [blocked["id"]]
+    assert _book_price(client) == 99.0
+
+    r = client.post(
+        "/api/compensation/tickets",
+        json={
+            "marker_id": marker["id"],
+            "effective_at": "2026-11-16T12:00:00Z",
+            "lines": [{"sku_code": SKU, "new_price": 28.0}],
+        },
+    )
+    assert r.status_code == 200
+    _set_clock(client, "2026-11-16T12:30:00Z")
+    res = _apply_due(client)
+    assert marker["id"] in res["resolved_marker_ids"]
+    assert _book_price(client) == 28.0
+    assert client.get("/api/compensation/gates").json()["blocked_skus"] == []
+    assert client.get("/api/compensation/gates/integrity").json()["divergent"] is False
+    # and only now does the held normal ticket land
+    _apply_due(client)
+    assert client.get(f"/api/tickets/{blocked['id']}").json()["status"] == "applied"
+
+
+def test_compensated_but_still_gated_is_lifted_by_facts(client):
+    """Path C '已补偿仍拦截': apply a fully covering compensation, then force
+    the marker back to open by hand. Facts must lift the gate again and the
+    legal follow-up normal ticket must apply."""
+    _, marker, _ = _prepare_gated_marker(client)
+    r = client.post(
+        "/api/compensation/tickets",
+        json={
+            "marker_id": marker["id"],
+            "effective_at": "2026-11-16T12:00:00Z",
+            "lines": [{"sku_code": SKU, "new_price": 28.0}],
+        },
+    )
+    comp = r.json()
+    assert r.status_code == 200
+    _set_clock(client, "2026-11-16T12:30:00Z")
+    _apply_due(client)
+    assert _book_price(client) == 28.0
+    assert client.get("/api/compensation/gates").json()["blocked_skus"] == []
+
+    # tamper: pretend the gate is still closed despite applied compensation
+    conn = _raw_conn()
+    conn.execute(
+        "UPDATE misapply_markers SET status='open', resolved_at=NULL, resolved_ticket_id=NULL WHERE id=?",
+        (marker["id"],),
+    )
+    conn.commit()
+    conn.close()
+
+    integrity = client.get("/api/compensation/gates/integrity").json()
+    assert any(d["kind"] == "compensated_but_still_gated" for d in integrity["divergences"])
+
+    # facts win: gate recomputes as lifted and points at the applied evidence
+    gates = client.get("/api/compensation/gates").json()
+    assert gates["blocked_skus"] == []
+    assert gates["resolved_marker_ids"] == [marker["id"]]
+    detail = client.get(f"/api/compensation/markers/{marker['id']}").json()
+    assert detail["status"] == "resolved"
+    evidence = [t for t in detail["compensation_tickets"] if t["status"] == "applied"]
+    assert evidence and evidence[0]["ticket_no"] == comp["ticket_no"]
+
+    # price-tag source already comes from the compensation ticket
+    book = next(r for r in client.get("/api/prices/book").json() if r["sku_code"] == SKU)
+    assert book["source_ticket_no"] == comp["ticket_no"]
+
+    # legal follow-up normal ticket now applies
+    legal = _make_ticket(client, "2026-11-16T13:00:00Z", price=31.5)
+    _set_clock(client, "2026-11-16T13:30:00Z")
+    _apply_due(client)
+    assert client.get(f"/api/tickets/{legal['id']}").json()["status"] == "applied"
+    assert _book_price(client) == 31.5
+    assert client.get("/api/compensation/gates/integrity").json()["divergent"] is False
+
+
+def test_partial_compensation_keeps_gate_closed_until_full_coverage(client):
+    """A partial compensation applies its price-tag rows but the gate must not
+    lift until every flagged SKU has applied compensation evidence."""
+    _set_clock(client, "2026-11-16T09:00:00Z")
+    r = client.post(
+        "/api/tickets",
+        json={
+            "title": "双SKU误用",
+            "effective_at": "2026-11-16T09:30:00Z",
+            "lines": [
+                {"sku_code": SKU, "new_price": 120.0},
+                {"sku_code": "SKU-SNK-011", "new_price": 55.0},
+            ],
+        },
+    )
+    _set_clock(client, "2026-11-16T10:00:00Z")
+    _apply_due(client)
+    marker = client.post(
+        "/api/compensation/markers",
+        json={"target_type": "ticket", "target_id": r.json()["id"]},
+    ).json()["marker"]
+
+    client.post(
+        "/api/compensation/tickets",
+        json={
+            "marker_id": marker["id"],
+            "effective_at": "2026-11-16T11:00:00Z",
+            "lines": [{"sku_code": SKU, "new_price": 28.0}],
+        },
+    )
+    _set_clock(client, "2026-11-16T11:30:00Z")
+    res = _apply_due(client)
+    assert res["resolved_marker_ids"] == []
+    gates = client.get("/api/compensation/gates").json()
+    gate = next(g for g in gates["gates"] if g["marker_id"] == marker["id"])
+    assert gate["covered_skus"] == [SKU]
+    assert gate["missing_skus"] == ["SKU-SNK-011"]
+    assert set(gates["blocked_skus"]) == {SKU, "SKU-SNK-011"}
+
+    # finish coverage -> facts lift the gate
+    client.post(
+        "/api/compensation/tickets",
+        json={
+            "marker_id": marker["id"],
+            "effective_at": "2026-11-16T12:00:00Z",
+            "lines": [{"sku_code": "SKU-SNK-011", "new_price": 12.5}],
+        },
+    )
+    _set_clock(client, "2026-11-16T12:30:00Z")
+    res = _apply_due(client)
+    assert marker["id"] in res["resolved_marker_ids"]
+    assert client.get("/api/compensation/gates").json()["blocked_skus"] == []
+
+
+def test_bypassed_normal_write_after_marking_is_reported(client):
+    """If a normal ticket's price-tag source lands after the marker was created
+    (gate bypass), the integrity cross-check must expose it even though the
+    append-only history cannot be rewritten."""
+    _, marker, blocked = _prepare_gated_marker(client)
+
+    conn = _raw_conn()
+    # applied_at / recorded_at are wall-clock timestamps (same clock the marker
+    # created_at uses); the forged bypass happens strictly after marking.
+    bypass_at = "2027-01-01T00:00:00Z"
+    conn.execute(
+        "UPDATE price_tickets SET status='applied', applied_at=?, apply_batch_id=NULL WHERE id=?",
+        (bypass_at, blocked["id"]),
+    )
+    conn.execute(
+        '''
+        INSERT INTO price_history(sku_code, price, source_ticket_no, effective_at, recorded_at)
+        VALUES (?,?,?,?,?)
+        ''',
+        (SKU, 77.0, blocked["ticket_no"], "2026-11-16T10:15:00Z", bypass_at),
+    )
+    conn.execute(
+        '''
+        UPDATE price_book SET current_price=77.0, source_ticket_no=?, effective_at=?, updated_at=?
+        WHERE sku_code=?
+        ''',
+        (blocked["ticket_no"], "2026-11-16T10:15:00Z", bypass_at, SKU),
+    )
+    conn.commit()
+    conn.close()
+
+    integrity = client.get("/api/compensation/gates/integrity").json()
+    assert integrity["divergent"] is True
+    assert any(
+        d["kind"] == "gated_sku_price_tag_from_normal_ticket"
+        and d["source_ticket_no"] == blocked["ticket_no"]
+        for d in integrity["divergences"]
+    )
+    # the gate itself stays closed: a normal ticket existing in the book does
+    # not count as compensation evidence
+    assert client.get("/api/compensation/gates").json()["blocked_skus"] == [SKU]
+
+
+def test_no_independent_gate_switch_table_or_endpoint(client):
+    """The legacy gate_shadow switch table must be gone and no API can lift a
+    gate except applying a compensation ticket."""
+    conn = _raw_conn()
+    names = {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    conn.close()
+    assert "gate_shadow" not in names
+
+    paths = {route.path for route in client.app.routes}
+    for p in paths:
+        assert "shadow" not in p.lower()
+        assert "force" not in p.lower()
+        assert "lift" not in p.lower()
+        assert "open-gate" not in p.lower()
+
+
+def test_legacy_shadow_table_is_dropped_on_schema_init(client):
+    """A database created by the old code (with the toggleable gate_shadow
+    table) loses that table on schema init, so the switch can never come back
+    and the gate can only be derived from facts."""
+    conn = _raw_conn()
+    conn.execute(
+        "CREATE TABLE gate_shadow (marker_id INTEGER PRIMARY KEY, blocked_skus TEXT NOT NULL, open INTEGER NOT NULL DEFAULT 1)"
+    )
+    conn.execute(
+        "INSERT INTO gate_shadow(marker_id, blocked_skus, open) VALUES (999, ?, 0)",
+        ('["SKU-TEA-001"]',),
+    )
+    conn.commit()
+    conn.close()
+
+    from app.seed import init_schema
+
+    conn = _raw_conn()
+    init_schema(conn)
+    conn.commit()
+    names = {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    conn.close()
+    assert "gate_shadow" not in names
+
+    # the seeded SKU is not gated by the vanished 'open=0' switch row
+    assert client.get("/api/compensation/gates").json()["blocked_skus"] == []

@@ -8,6 +8,7 @@ const tickets = ref([])
 const batches = ref([])
 const markers = ref([])
 const gates = ref({ blocked_skus: [], gates: [] })
+const integrity = ref(null)
 const msg = ref('')
 const err = ref('')
 
@@ -18,13 +19,14 @@ const lineDraft = reactive({ sku_code: '', new_price: '' })
 const openMarkers = computed(() => markers.value.filter((m) => m.status === 'open'))
 
 async function refresh() {
-  const [s, c, ts, bs, ms, gs] = await Promise.all([
+  const [s, c, ts, bs, ms, gs, gi] = await Promise.all([
     api.compStrategy(),
     api.clock(),
     api.tickets(),
     api.batches(),
     api.markers(),
     api.gates(),
+    api.gateIntegrity(),
   ])
   strategy.value = s.compensation_strategy
   clock.value = c.business_clock
@@ -32,6 +34,7 @@ async function refresh() {
   batches.value = bs
   markers.value = ms
   gates.value = gs
+  integrity.value = gi
 }
 
 async function saveStrategy(value) {
@@ -205,11 +208,16 @@ onMounted(() => refresh().catch((e) => (err.value = e.message)))
   </div>
 
   <div class="panel">
-    <h2>禁应用闸（源自未解除的误用标记，与价签/历史/对账同源）</h2>
-    <p v-if="!gates.blocked_skus.length" class="msg ok">当前无禁闸商品。</p>
+    <h2>禁应用闸（由已应用补偿单与价签来源事实重算，无独立开关，不可手拨）</h2>
+    <p v-if="!gates.blocked_skus.length" class="msg ok">
+      当前无禁闸商品；每个已解除标记均可指向覆盖其全部 SKU 的已应用补偿单及价签来源行。
+    </p>
     <table v-else>
       <thead>
-        <tr><th>标记</th><th>对象</th><th>策略</th><th>禁闸 SKU</th><th>原因</th><th>创建时间</th></tr>
+        <tr>
+          <th>标记</th><th>对象</th><th>策略</th><th>禁闸 SKU</th>
+          <th>已有补偿证据</th><th>仍缺补偿</th><th>原因</th><th>创建时间</th>
+        </tr>
       </thead>
       <tbody>
         <tr v-for="g in gates.gates" :key="g.marker_id">
@@ -217,11 +225,42 @@ onMounted(() => refresh().catch((e) => (err.value = e.message)))
           <td>{{ g.target_type }} #{{ g.target_ticket_id ?? g.target_batch_id }}</td>
           <td>{{ g.strategy === 'auto_draft' ? '自动草稿' : '仅人工' }}</td>
           <td>{{ g.blocked_skus.join(', ') }}</td>
+          <td>{{ g.covered_skus.length ? g.covered_skus.join(', ') : '—' }}</td>
+          <td>
+            <span v-if="g.missing_skus.length" class="tag warn">{{ g.missing_skus.join(', ') }}</span>
+            <span v-else class="tag ok">已全覆盖</span>
+          </td>
           <td>{{ g.reason || '—' }}</td>
           <td>{{ g.created_at }}</td>
         </tr>
       </tbody>
     </table>
+  </div>
+
+  <div class="panel">
+    <h2>禁闸三源一致性核对（标记表 × 补偿单状态 × 价签来源，只读）</h2>
+    <p v-if="!integrity" class="msg">核对中…</p>
+    <p v-else-if="!integrity.divergent" class="msg ok">
+      三源一致：禁闸判定均由已应用补偿事实与价签来源支撑，无分叉。
+    </p>
+    <template v-else>
+      <p class="msg err">发现 {{ integrity.divergences.length }} 处分叉（读取禁闸/应用到期时已按事实自动重算收口）：</p>
+      <table>
+        <thead><tr><th>分叉类型</th><th>标记</th><th>明细</th></tr></thead>
+        <tbody>
+          <tr v-for="(d, i) in integrity.divergences" :key="i">
+            <td><span class="tag warn">{{ d.kind }}</span></td>
+            <td>{{ d.marker_no }} (#{{ d.marker_id }})</td>
+            <td>
+              <span v-if="d.missing_skus">缺补偿 SKU：{{ d.missing_skus.join(', ') }}</span>
+              <span v-else-if="d.blocked_skus">仍拦截 SKU：{{ d.blocked_skus.join(', ') }}</span>
+              <span v-else-if="d.ticket_no">{{ d.ticket_no }} / {{ d.sku_code }} 无价签来源行</span>
+              <span v-else-if="d.source_ticket_no">{{ d.sku_code }} 现行价签来源为普通单 {{ d.source_ticket_no }}</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </template>
   </div>
 
   <div class="panel" v-if="strategy === 'manual'">

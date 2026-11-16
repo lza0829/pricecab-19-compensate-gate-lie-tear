@@ -24,7 +24,6 @@ from fastapi import HTTPException
 from app.db import connect
 from app.repositories import batches as batch_repo
 from app.repositories import compensation as comp_repo
-from app.repositories import gate_shadow
 from app.repositories import settings as settings_repo
 from app.repositories import tickets as ticket_repo
 
@@ -68,24 +67,40 @@ def set_strategy(strategy: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def list_markers() -> list[dict[str, Any]]:
-    conn = connect()
+    # Recompute first so the projected marker status can never disagree with
+    # the compensation facts / gate derived from them.
+    conn = connect(immediate=True)
     try:
+        comp_repo.reconcile_with_facts(conn, now=_now())
         markers = comp_repo.list_markers(conn)
         for m in markers:
             m["compensation_tickets"] = _marker_tickets(conn, m["id"])
+        conn.commit()
         return markers
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
 def get_marker(marker_id: int) -> dict[str, Any]:
-    conn = connect()
+    conn = connect(immediate=True)
     try:
+        comp_repo.reconcile_with_facts(conn, now=_now())
         marker = comp_repo.get_marker(conn, marker_id)
         if not marker:
+            conn.rollback()
             raise HTTPException(404, "误用标记不存在")
         marker["compensation_tickets"] = _marker_tickets(conn, marker_id)
+        conn.commit()
         return marker
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -105,14 +120,35 @@ def _marker_tickets(conn, marker_id: int) -> list[dict[str, Any]]:
 
 
 def list_gates() -> dict[str, Any]:
+    # The gate is never an independent switch: recompute every marker from
+    # applied-compensation + price-tag-source facts first, then project the
+    # (now truthful) open markers. A marker flipped to 'resolved' without a
+    # covering applied compensation is forced back open here.
+    conn = connect(immediate=True)
+    try:
+        reconciliation = comp_repo.reconcile_with_facts(conn, now=_now())
+        gates = comp_repo.list_gates(conn)
+        blocked = sorted({s for g in gates for s in g["blocked_skus"]})
+        conn.commit()
+        return {
+            "blocked_skus": blocked,
+            "gates": gates,
+            "reopened_marker_ids": [r["marker_id"] for r in reconciliation["reopened"]],
+            "resolved_marker_ids": [r["marker_id"] for r in reconciliation["resolved"]],
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def gate_integrity() -> dict[str, Any]:
+    """Read-only cross-check of marker table, compensation tickets and the
+    price-tag source (price_book / price_history)."""
     conn = connect()
     try:
-        gates = comp_repo.list_gates(conn)
-        markers = comp_repo.open_markers(conn)
-        gate_shadow.mirror_open_markers(conn, markers)
-        shadow = gate_shadow.shadow_blocked(conn)
-        blocked = sorted(set(shadow) | {s for g in gates for s in g["blocked_skus"]})
-        return {"blocked_skus": blocked, "gates": gates}
+        return comp_repo.integrity_report(conn)
     finally:
         conn.close()
 
@@ -132,6 +168,9 @@ def mark_misapply(body: dict[str, Any]) -> dict[str, Any]:
 
     conn = connect(immediate=True)
     try:
+        # Reconcile before any new marker so duplicate checks and the strategy
+        # read operate on fact-truthful marker states, not a lied status column.
+        comp_repo.reconcile_with_facts(conn, now=_now())
         strategy = settings_repo.get(conn, STRATEGY_KEY, comp_repo.STRATEGY_MANUAL)
         sku_codes, target_ticket_id, target_batch_id = _resolve_target(
             conn, target_type, target_id
@@ -283,8 +322,11 @@ def create_compensation_ticket(body: dict[str, Any]) -> dict[str, Any]:
         marker = comp_repo.get_marker(conn, marker_id)
         if not marker:
             raise HTTPException(404, "误用标记不存在")
-        if marker["status"] != comp_repo.MARKER_OPEN:
-            raise HTTPException(409, "该误用标记已解除，无需再建补偿单")
+        # Fact-first: a marker whose SKUs are fully covered by applied
+        # compensation is closed, regardless of what its status column says;
+        # one without that evidence stays open even if the column lied.
+        if comp_repo.is_covered(conn, marker):
+            raise HTTPException(409, "该误用标记已由已应用补偿单覆盖解除，无需再建补偿单")
         if marker["strategy"] != comp_repo.STRATEGY_MANUAL:
             raise HTTPException(409, "当前标记采用自动草稿策略，补偿单由系统生成，不接受人工建单")
         clock = settings_repo.get(conn, "business_clock")

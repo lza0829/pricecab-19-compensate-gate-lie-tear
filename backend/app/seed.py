@@ -106,6 +106,11 @@ def init_schema(conn) -> None:
           resolved_at TEXT,
           resolved_ticket_id INTEGER
         );
+        /* The apply-gate must never be an independent switch: it is recomputed
+           from applied compensation + price-tag-source facts. Remove the
+           legacy shadow table whose open boolean could be toggled without any
+           compensation evidence (the "lied gate"). */
+        DROP TABLE IF EXISTS gate_shadow;
         '''
     )
     # Forward-only migrations for databases created before compensation support.

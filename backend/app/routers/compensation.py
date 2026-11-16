@@ -60,6 +60,11 @@ def list_gates():
     return svc.list_gates()
 
 
+@router.get("/gates/integrity")
+def gate_integrity():
+    return svc.gate_integrity()
+
+
 @router.post("/tickets")
 def create_compensation_ticket(body: CompensationTicketIn):
     return svc.create_compensation_ticket(body.model_dump())
